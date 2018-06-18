@@ -1,4 +1,4 @@
-require 'aws-sdk'
+require 'aws-sdk-opsworks'
 require 'timeout'
 class OpsworksInteractor
   begin
@@ -13,7 +13,7 @@ class OpsworksInteractor
   # http://docs.aws.amazon.com/opsworks/latest/userguide/cli-examples.html
   OPSWORKS_REGION = 'us-east-1'
 
-  def initialize(access_key_id, secret_access_key, redis: nil)
+  def initialize(access_key_id, secret_access_key, redis: nil, version_2: false)
     # All opsworks endpoints are always in the OPSWORKS_REGION
     @opsworks_client = Aws::OpsWorks::Client.new(
       access_key_id:     access_key_id,
@@ -21,11 +21,19 @@ class OpsworksInteractor
       region: OPSWORKS_REGION
     )
 
-    @elb_client = Aws::ElasticLoadBalancing::Client.new(
-      access_key_id:     access_key_id,
-      secret_access_key: secret_access_key,
-      region: ENV['AWS_REGION'] || OPSWORKS_REGION
-    )
+    if version_2
+      @elb_client = Aws::ElasticLoadBalancingV2::Client.new(
+        access_key_id:     access_key_id,
+        secret_access_key: secret_access_key,
+        region: ENV['AWS_REGION'] || OPSWORKS_REGION
+      ) 
+    else
+      @elb_client = Aws::ElasticLoadBalancing::Client.new(
+        access_key_id:     access_key_id,
+        secret_access_key: secret_access_key,
+        region: ENV['AWS_REGION'] || OPSWORKS_REGION
+      )
+  end
 
     # Redis host and port may be supplied if you want to run your deploys with
     # mutual exclusive locking (recommended)
@@ -112,7 +120,13 @@ class OpsworksInteractor
           instance_id: instance.instance_id
         )
       ensure
-        attach_to_elbs(instance: instance, load_balancers: load_balancers) if load_balancers
+        if load_balancers && load_balancers.length != 0
+         if load_balancers[0].is_a?(Aws::ElasticLoadBalancingV2::Types::TargetGroup)
+           attach_to_elbs_v2(instance: instance, load_balancers: load_balancers)
+         else
+           attach_to_elbs(instance: instance, load_balancers: load_balancers)
+         end
+        end
 
         log("=== Done deploying on #{instance.hostname} ===\n\n")
       end
@@ -205,28 +219,51 @@ class OpsworksInteractor
       fail(ArgumentError, "instance must be a Aws::OpsWorks::Types::Instance struct")
     end
 
-    all_load_balancers =  @elb_client.describe_load_balancers
-                          .load_balancer_descriptions
+    if @elb_client.class == Aws::ElasticLoadBalancingV2::Client
+        all_load_balancers =  @elb_client.describe_target_groups.target_groups
+        load_balancers = detach_from_v2(all_load_balancers, instance)
+    else
+        all_load_balancers =  @elb_client.describe_load_balancers
+                            .load_balancer_descriptions
+        load_balancers = detach_from(all_load_balancers, instance)
+    end
 
-    load_balancers = detach_from(all_load_balancers, instance)
 
     lb_wait_params = []
 
     load_balancers.each do |lb|
-      params = {
-        load_balancer_name: lb.load_balancer_name,
-        instances: [{ instance_id: instance.ec2_instance_id }]
-      }
+      if lb.is_a?(Aws::ElasticLoadBalancingV2::Types::TargetGroup)
+         params = {
+          target_group_arn: lb.target_group_arn,
+          targets: [
+            {
+              id: instance.ec2_instance_id
+            }
+          ], 
+         }
+       
+       remaining_instances = @elb_client.deregister_targets(params)
+    
+       log(<<-MSG.squish)
+          Will detach instance #{instance.ec2_instance_id} from
+          #{lb.target_group_name}
+       MSG
+      else
+        params = {
+          load_balancer_name: lb.load_balancer_name,
+          instances: [{ instance_id: instance.ec2_instance_id }]
+        }
 
-      remaining_instances = @elb_client
-                            .deregister_instances_from_load_balancer(params)
-                            .instances
+        remaining_instances = @elb_client
+                              .deregister_instances_from_load_balancer(params)
+                              .instances
 
-      log(<<-MSG.squish)
-        Will detach instance #{instance.ec2_instance_id} from
-        #{lb.load_balancer_name} (remaining attached instances:
-        #{remaining_instances.map(&:instance_id).join(', ')})
-      MSG
+        log(<<-MSG.squish)
+          Will detach instance #{instance.ec2_instance_id} from
+          #{lb.load_balancer_name} (remaining attached instances:
+          #{remaining_instances.map(&:instance_id).join(', ')})
+        MSG
+      end
 
       lb_wait_params << params
     end
@@ -234,9 +271,13 @@ class OpsworksInteractor
     if lb_wait_params.any?
       lb_wait_params.each do |params|
         # wait for all load balancers to list the instance as deregistered
-        @elb_client.wait_until(:instance_deregistered, params)
-
-        log("✓ detached from #{params[:load_balancer_name]}")
+        if @elb_client.is_a?(Aws::ElasticLoadBalancingV2::Client)
+          @elb_client.wait_until(:target_deregistered, params)
+          log("✓ detached from #{params[:target_group_arn]}")
+        else
+          @elb_client.wait_until(:instance_deregistered, params)
+          log("✓ detached from #{params[:load_balancer_name]}")
+        end
       end
     else
       log("No load balancers found for instance #{instance.ec2_instance_id}")
@@ -244,6 +285,40 @@ class OpsworksInteractor
 
     load_balancers
   end
+
+
+  # Modified detach_from to support v2 load balancers
+  def detach_from_v2(load_balancers, instance)
+    check_arguments(instance: instance, load_balancers: load_balancers)
+
+    load_balancers.select do |lb|
+      target_group = lb.target_group_arn
+      target_health_group = @elb_client.describe_target_health({target_group_arn: lb.target_group_arn}).target_health_descriptions
+      next if target_health_group.length == 0
+
+      matched_instance = target_health_group.any? do |lb_instance|
+        instance.ec2_instance_id == lb_instance.target.id
+      end
+
+      if matched_instance && target_health_group.count > 1
+        # We can detach this instance safely because there is at least one other
+        # instance to handle traffic
+        true
+      elsif matched_instance && target_health_group.count == 1
+        # We can't detach this instance because it's the only one
+        log(<<-MSG.squish)
+          Will not detach #{instance.ec2_instance_id} from target group
+          #{lb.target_group_name} because it is the only instance connected
+        MSG
+
+        false
+      else
+        # This load balancer isn't attached to this instance
+        false
+      end
+    end
+  end
+
 
   # Accepts load_balancers as array of
   # Aws::ElasticLoadBalancing::Types::LoadBalancerDescription
@@ -281,6 +356,46 @@ class OpsworksInteractor
       end
     end
   end
+
+  # Modified attach_to_elbs to support ALBs
+  def attach_to_elbs_v2(instance:, load_balancers:)
+    check_arguments(instance: instance, load_balancers: load_balancers)
+
+    if load_balancers.empty?
+      log("No load balancers to attach to")
+      return {}
+    end
+
+    lb_wait_params = []
+    registered_instances = {} # return this
+
+    load_balancers.each do |lb|
+      params = {
+      target_group_arn: lb.target_group_arn,
+      targets: [
+        {
+          id: instance.ec2_instance_id
+        }
+      ], 
+    }
+
+      result = @elb_client.register_targets(params)
+
+      registered_instances[lb.target_group_arn] = lb.target_group_name
+      lb_wait_params << params
+    end
+
+    log("Re-attaching instance #{instance.ec2_instance_id} to all load balancers")
+
+    # Wait for all load balancers to list the instance as registered
+    lb_wait_params.each do |params|
+      @elb_client.wait_until(:target_in_service, params)
+      log("✓ re-attached to #{registered_instances[params[:target_group_arn]]}")
+    end
+
+    registered_instances
+  end
+
 
   # Takes an instance as a Aws::OpsWorks::Types::Instance
   # and load balancers as an array of
@@ -337,7 +452,7 @@ class OpsworksInteractor
     end
     unless load_balancers.respond_to?(:each) &&
            load_balancers.all? do |lb|
-             lb.is_a?(Aws::ElasticLoadBalancing::Types::LoadBalancerDescription)
+             lb.is_a?(Aws::ElasticLoadBalancing::Types::LoadBalancerDescription) || lb.is_a?(Aws::ElasticLoadBalancingV2::Types::TargetGroup)
            end
       fail(ArgumentError, <<-MSG.squish)
         :load_balancers must be a collection of
